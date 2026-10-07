@@ -1,0 +1,46 @@
+# Per-job tmpfs mounts hide jail submounts at or below /tmp, /dev/shm and /mnt/memory.
+# Reject such NodeSets while their SlurmCluster has spec.jobTmpfs.enabled (the default).
+# Kept as plain YAML outside helmify, which renames the policy without updating the binding.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: soperator-nodeset-job-tmpfs
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: slurm.nebius.ai/v1
+    kind: SlurmCluster
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["slurm.nebius.ai"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["nodesets"]
+  variables:
+    - name: shadowedMounts
+      expression: >-
+        object.spec.?slurmd.?volumes.?jailSubMounts.orValue([])
+          .filter(m, m.mountPath.matches('^/+(tmp|dev/+shm|mnt/+memory)(/.*)?$'))
+          .map(m, m.mountPath)
+  validations:
+    - expression: >-
+        params.metadata.name != object.spec.?clusterName.orValue('') ||
+        !params.spec.?jobTmpfs.?enabled.orValue(true) ||
+        size(variables.shadowedMounts) == 0
+      messageExpression: >-
+        'jailSubMounts ' + variables.shadowedMounts.join(', ') +
+        ' are hidden from jobs by per-job tmpfs mounts at /tmp, /dev/shm and /mnt/memory;' +
+        ' move them elsewhere or set jobTmpfs.enabled=false in SlurmCluster ' + params.metadata.name
+      reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: soperator-nodeset-job-tmpfs
+spec:
+  policyName: soperator-nodeset-job-tmpfs
+  validationActions: ["Deny"]
+  paramRef:
+    # Every SlurmCluster in the NodeSet's namespace; the policy matches spec.clusterName.
+    selector: {}
+    parameterNotFoundAction: Allow

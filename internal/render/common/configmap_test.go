@@ -1,6 +1,7 @@
 package common
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -448,6 +449,18 @@ func TestRenderSlurmConfigMapPAMSlurmAdoptLaunchParameters(t *testing.T) {
 	}
 }
 
+func TestRenderSlurmConfigMapJobTmpfs(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			result := RenderConfigMapSlurmConfigs(&values.SlurmCluster{JobTmpfsEnabled: enabled})
+
+			slurmConfig := result.Data[consts.ConfigMapKeySlurmBaseConfig]
+			assert.Equal(t, enabled, strings.Contains(slurmConfig, "NamespaceType=namespace/linux"))
+			assert.NotEmpty(t, result.Data[consts.ConfigMapKeyNamespaceConfig])
+		})
+	}
+}
+
 func TestRenderConfigMapSlurmConfigs_FileNamesAndWarnings(t *testing.T) {
 	result := RenderConfigMapSlurmConfigs(&values.SlurmCluster{})
 
@@ -489,6 +502,7 @@ func TestRenderConfigMapSlurmConfigs_FileNamesAndWarnings(t *testing.T) {
 		consts.ConfigMapKeySpankConfig,
 		consts.ConfigMapKeyGresConfig,
 		consts.ConfigMapKeyMPIConfig,
+		consts.ConfigMapKeyNamespaceConfig,
 	} {
 		assert.Contains(t, result.Data[key], ManagedSlurmConfigWarning())
 	}
@@ -1614,4 +1628,10 @@ func TestRenderSlurmConfigMapSuspendTimeout(t *testing.T) {
 	config := generateSlurmConfig(cluster).Render()
 	assert.Contains(t, config, "SuspendTimeout=300")
 	assert.Equal(t, 1, strings.Count(config, "SuspendTimeout="))
+}
+
+func TestNodeSetHostlist(t *testing.T) {
+	assert.Equal(t, "worker-0", nodeSetHostlist("worker", 1))
+	assert.Equal(t, "worker-[0-1]", nodeSetHostlist("worker", 2))
+	assert.Equal(t, "gb200-0-[0-17]", nodeSetHostlist("gb200-0", 18))
 }

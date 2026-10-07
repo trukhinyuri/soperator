@@ -124,6 +124,20 @@ spec:
                 - healthCheckNodeState
                 - healthCheckProgram
                 type: object
+              jobTmpfs:
+                default:
+                  enabled: true
+                description: JobTmpfs controls whether each job gets private tmpfs
+                  mounts at /tmp, /dev/shm and /mnt/memory.
+                properties:
+                  enabled:
+                    default: true
+                    description: |-
+                      Enabled creates per-job tmpfs mounts at /tmp, /dev/shm and /mnt/memory through Slurm job namespaces.
+                      Their memory is charged to the job cgroup, and they are removed when the job ends.
+                      When disabled, jobs see the same worker directories as SSH sessions.
+                    type: boolean
+                type: object
               k8sNodeFilters:
                 description: K8sNodeFilters define the k8s node filters used in Slurm
                   node specifications

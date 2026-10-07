@@ -36,6 +36,7 @@ type SlurmClusterInfo struct {
 	AccountingEnabled    bool
 	LoginDockerEnabled   bool
 	PAMSlurmAdoptEnabled bool
+	JobTmpfsEnabled      bool
 	CustomSlurmConfig    *string
 }
 
@@ -68,8 +69,14 @@ func (c *KubectlClient) SlurmCluster(ctx context.Context, name string) (SlurmClu
 		AccountingEnabled:    cluster.Spec.SlurmNodes.Accounting.Enabled,
 		LoginDockerEnabled:   cluster.Spec.SlurmNodes.Login.Docker.Enabled,
 		PAMSlurmAdoptEnabled: cluster.Spec.PAMSlurmAdopt.Enabled,
+		JobTmpfsEnabled:      jobTmpfsEnabled(cluster.Spec.JobTmpfs),
 		CustomSlurmConfig:    cluster.Spec.CustomSlurmConfig,
 	}, nil
+}
+
+// jobTmpfsEnabled treats an omitted setting as enabled, matching the SlurmCluster CRD default.
+func jobTmpfsEnabled(jobTmpfs *kubeobjects.SlurmClusterJobTmpfs) bool {
+	return jobTmpfs == nil || jobTmpfs.Enabled == nil || *jobTmpfs.Enabled
 }
 
 func (c *KubectlClient) ReadyWorkloadPodName(ctx context.Context, clusterName, component string) (string, error) {

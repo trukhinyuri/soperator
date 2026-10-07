@@ -1,0 +1,28 @@
+suite: test NodeSet job tmpfs admission policy
+templates:
+  - templates/nodeset-job-tmpfs-admission-policy.yaml
+tests:
+  - it: should bind the policy it defines to SlurmCluster params
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: ValidatingAdmissionPolicy
+        documentIndex: 0
+      - equal:
+          path: spec.paramKind
+          value:
+            apiVersion: slurm.nebius.ai/v1
+            kind: SlurmCluster
+        documentIndex: 0
+      - isKind:
+          of: ValidatingAdmissionPolicyBinding
+        documentIndex: 1
+      - equal:
+          path: spec.policyName
+          value: soperator-nodeset-job-tmpfs
+        documentIndex: 1
+      - equal:
+          path: spec.paramRef.parameterNotFoundAction
+          value: Allow
+        documentIndex: 1

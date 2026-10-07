@@ -120,9 +120,10 @@ restart them and get back to square one.
 
 For Linux gurus, this approach may sound a bit out there. Linux isn’t built to share its root filesystem. That’s true,
 which is why the filesystem isn’t entirely shared — some directories are local to each node. These include `/dev`,
-containing device drivers; `/tmp`, containing temporary files stored in RAM; `/proc`, containing information about
-running processes; `/run`, containing runtime variable data; and others. Some low-level libraries, device drivers, and
-system configs are also not shared, though they’re identical — propagated (bind-mounted) from each host’s environment.
+containing device drivers; `/proc`, containing information about running processes; `/run`, containing runtime variable
+data; and others. Slurm jobs additionally receive private tmpfs filesystems at `/mnt/memory`, `/tmp`, and `/dev/shm`,
+as described [below](#temporary-filesystems-for-jobs). Some low-level libraries, device drivers, and system configs
+are also not shared, though they’re identical — propagated (bind-mounted) from each host’s environment.
 
 Here’s a diagram that tries to explain this concept visually:
 <img src="images/directory_structure_diagram.svg" alt="Directory Structure Diagram" width="100%" height="auto"/>
@@ -153,11 +154,79 @@ This plugin isn’t bound to Soperator setup and could theoretically work in typ
 
 SSH sessions on login and worker nodes enter the same jail through a PAM session module. The module creates a private
 mount namespace for each session and uses `pivot_root`, allowing tools such as Enroot to create their own namespaces
-inside the jail.
+inside the jail. When worker SSH adoption is enabled, `pam_slurm_adopt` first joins the session to its job's cgroup and
+mount namespace, so the session sees the same temporary filesystems as the job.
 
 The jail storage is initially populated at the moment of creating the cluster. It's done by the K8s job "populate-jail"
 that runs only once. It uses [images/populate_jail/](../images/populate_jail) container image. The content this job
 copies is the filesystem of another container image called [jail](../images/jail).
+
+
+### Temporary filesystems for jobs
+
+Each Slurm allocation receives private tmpfs filesystems at `/mnt/memory`, `/tmp`, and `/dev/shm` on each allocated worker.
+Steps of the same job share their contents locally; other jobs and workers have separate filesystems. This feature
+requires cgroup v2 (`SlurmCluster.spec.cgroupVersion: v2`). It is controlled by `jobTmpfs.enabled` in the
+`slurm-cluster` Helm chart (`SlurmCluster.spec.jobTmpfs.enabled`), which defaults to `true`; change it when creating or
+recreating a cluster.
+
+When the feature is disabled, Soperator omits `NamespaceType`, and jobs see the same directories as an SSH session on
+the worker:
+
+| Path | Volume |
+| --- | --- |
+| `/tmp` | `emptyDir` on the node's ephemeral storage (boot disk) |
+| `/mnt/memory` | memory-backed `emptyDir` limited to `spec.slurmd.resources.memory` |
+| `/dev/shm` | memory-backed `emptyDir` limited to `spec.slurmd.resources.memory` |
+
+These directories are shared by all jobs on the worker. Only `/dev/shm` is cleaned, and only when
+`drop_posix_shmem.sh` is enabled (see below).
+
+Soperator enables Slurm's [namespace/linux plugin](https://slurm.schedmd.com/namespace.html) with
+`NamespaceType=namespace/linux` and `PrologFlags=contain`. It distributes generated `namespace.yaml` through
+ConfigMap/JailedConfig, using `tmpfs: true`, `mode=1777`, and `shared: true`. With `shared: true`, the job
+mount namespace is a slave of the slurmd container, so host mounts propagated with `HostToContainer` (for example,
+`/run/nvidia`) still reach running jobs, while job tmpfs mounts do not propagate back. Namespace state lives under
+`/var/spool/slurmd/job-container/%n`. One hostlist per NodeSet keeps configuration compact for large clusters.
+
+Slurm creates the mounts before job steps enter the jail. The native SPANK plugin copies the job mount namespace,
+disables propagation back to it, and binds the same filesystems into `/mnt/jail` before `pivot_root`. This makes
+`sbcast` and `srun --bcast` destinations match the paths seen by job processes. With `join_container=true`,
+`pam_slurm_adopt` joins SSH sessions to the job; the PAM jail module applies the same bindings. Service processes
+and unadopted sessions retain their existing mounts. Both modules bind only when their mount namespace differs from
+that of the container's PID 1, so a step that slurmd did not place in a job namespace (for example, while a
+configuration change is still propagating) keeps the service-level mounts instead of failing.
+
+When the job finishes or is cancelled, Slurm terminates its processes and releases namespace references. The kernel frees
+tmpfs contents after the last references disappear. No temporary-directory creation or cleanup scripts are needed.
+
+Tmpfs pages allocated by job processes count toward their cgroup memory limit alongside process memory. Filesystem
+capacity ceilings do not reserve RAM or increase that limit. Inspect `memory.current` and `memory.stat` (`shmem`);
+Slurm RSS statistics may omit tmpfs usage. Capacity settings come from each NodeSet:
+
+| Job path | NodeSet setting |
+| --- | --- |
+| `/mnt/memory`, `/tmp`, `/dev/shm` | `spec.slurmd.resources.memory` |
+
+Directories are root-owned; Slurm applies `nosuid,nodev`. Only mount namespaces are introduced.
+
+When reusing configuration or job scripts:
+
+- Use `/mnt/memory` directly instead of `/mnt/memory/job_${SLURM_JOB_ID}` and save durable results elsewhere.
+- Remove overrides for the deleted `job_tmpfs_recreate.sh`, `job_tmpfs_delete.sh`, and `job_tmpfs_delete_leftover.sh`
+  hooks, including equivalent custom cleanup scripts.
+- Move custom mounts outside these paths, for example to `/mnt/local`: fresh tmpfs mounts hide existing contents
+  and submounts. Large staging or image-extraction operations under `/tmp` now consume job memory. While the feature
+  is enabled, the `soperator-nodeset-job-tmpfs` ValidatingAdmissionPolicy, shipped with the `soperator` Helm chart,
+  rejects NodeSets whose `jailSubMounts` are at or below `/tmp`, `/dev/shm`, or `/mnt/memory`.
+- Remove `sharedMemorySize` from NodeSet volumes: `/dev/shm` is sized from `spec.slurmd.resources.memory`.
+
+Docker bind mounts of these private paths require separate integration with the daemon's mount namespace and
+remain deferred. Containers started with `docker run --ipc=host` use the worker-wide `/dev/shm` instead of the job's,
+and Docker never removes files from it, so segments left by killed processes outlive the job. The built-in
+`drop_posix_shmem.sh` prolog/epilog script cleans it before and after jobs that allocate all GPUs or all CPUs of the
+node. It is disabled by default; enable it with `slurmScripts.builtIn."drop_posix_shmem.sh".enabled` in the
+`slurm-cluster` Helm chart on clusters where Docker is enabled on workers.
 
 
 ### GPU health checks

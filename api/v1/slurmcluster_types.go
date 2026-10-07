@@ -123,6 +123,12 @@ type SlurmClusterSpec struct {
 	// +kubebuilder:validation:Optional
 	PAMSlurmAdopt *PAMSlurmAdopt `json:"pamSlurmAdopt,omitempty"`
 
+	// JobTmpfs controls whether each job gets private tmpfs mounts at /tmp, /dev/shm and /mnt/memory.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default={enabled: true}
+	JobTmpfs *JobTmpfs `json:"jobTmpfs,omitempty"`
+
 	// MPIConfig represents the PMIx configuration in mpi.conf. Not all options are supported.
 	//
 	// +kubebuilder:validation:Optional
@@ -165,6 +171,17 @@ type PAMSlurmAdopt struct {
 	//
 	// +kubebuilder:validation:Optional
 	ExemptGroups []string `json:"exemptGroups,omitempty"`
+}
+
+// JobTmpfs defines job-private temporary filesystems on worker nodes.
+type JobTmpfs struct {
+	// Enabled creates per-job tmpfs mounts at /tmp, /dev/shm and /mnt/memory through Slurm job namespaces.
+	// Their memory is charged to the job cgroup, and they are removed when the job ends.
+	// When disabled, jobs see the same worker directories as SSH sessions.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=true
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // SlurmConfig represents the Slurm configuration in slurm.conf

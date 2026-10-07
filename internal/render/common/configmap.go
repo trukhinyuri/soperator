@@ -32,6 +32,7 @@ import (
 // [consts.ConfigMapKeySpankConfig] - SPANK plugins config
 // [consts.ConfigMapKeyGresConfig] - GRES config
 // [consts.ConfigMapKeyMPIConfig] - PMIx config
+// [consts.ConfigMapKeyNamespaceConfig] - Job mount namespace config
 func RenderConfigMapSlurmConfigs(cluster *values.SlurmCluster) corev1.ConfigMap {
 	return corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -48,6 +49,7 @@ func RenderConfigMapSlurmConfigs(cluster *values.SlurmCluster) corev1.ConfigMap 
 			consts.ConfigMapKeySpankConfig:         WithManagedSlurmConfigWarning(generateSpankConfig(cluster)).Render(),
 			consts.ConfigMapKeyGresConfig:          WithManagedSlurmConfigWarning(generateGresConfig(cluster)).Render(),
 			consts.ConfigMapKeyMPIConfig:           WithManagedSlurmConfigWarning(generateMPIConfig(cluster)).Render(),
+			consts.ConfigMapKeyNamespaceConfig:     WithManagedSlurmConfigWarning(generateNamespaceConfig(cluster)).Render(),
 		},
 	}
 }
@@ -79,10 +81,19 @@ func RenderJailedConfigSlurmConfigs(cluster *values.SlurmCluster) slurmv1alpha1.
 				{Key: consts.ConfigMapKeySpankConfig, Path: filepath.Join("/etc/slurm/", consts.ConfigMapKeySpankConfig)},
 				{Key: consts.ConfigMapKeyGresConfig, Path: filepath.Join("/etc/slurm/", consts.ConfigMapKeyGresConfig)},
 				{Key: consts.ConfigMapKeyMPIConfig, Path: filepath.Join("/etc/slurm/", consts.ConfigMapKeyMPIConfig)},
+				{Key: consts.ConfigMapKeyNamespaceConfig, Path: filepath.Join("/etc/slurm/", consts.ConfigMapKeyNamespaceConfig)},
 			},
 			UpdateActions: []slurmv1alpha1.UpdateAction{slurmv1alpha1.UpdateActionReconfigure},
 		},
 	}
+}
+
+// nodeSetHostlist returns the Slurm hostlist of all workers in a NodeSet. replicas must be positive.
+func nodeSetHostlist(name string, replicas int32) string {
+	if replicas == 1 {
+		return name + "-0"
+	}
+	return fmt.Sprintf("%s-[0-%d]", name, replicas-1)
 }
 
 // AddNodeSetsToSlurmConfig adds nodeset configuration to the slurm config
@@ -97,12 +108,9 @@ func AddNodeSetsToSlurmConfig(res *renderutils.PropertiesConfig, cluster *values
 	}
 
 	for _, nodeSet := range cluster.NodeSets {
-		switch {
-		case nodeSet.Spec.Replicas == 1:
-			res.AddProperty("NodeSet", fmt.Sprintf("%s Nodes=%s-0", nodeSet.Name, nodeSet.Name))
-		case nodeSet.Spec.Replicas > 1:
-			res.AddProperty("NodeSet", fmt.Sprintf("%s Nodes=%s-[0-%d]", nodeSet.Name, nodeSet.Name, nodeSet.Spec.Replicas-1))
-		default:
+		if nodeSet.Spec.Replicas > 0 {
+			res.AddProperty("NodeSet", fmt.Sprintf("%s Nodes=%s", nodeSet.Name, nodeSetHostlist(nodeSet.Name, nodeSet.Spec.Replicas)))
+		} else {
 			res.AddComment(fmt.Sprintf("WARNING: NodeSet %s has 0 replicas, skipping", nodeSet.Name))
 		}
 	}
@@ -134,12 +142,7 @@ func AddNodesToSlurmConfig(res *renderutils.PropertiesConfig, cluster *values.Sl
 			continue
 		}
 
-		var nodeRange string
-		if nodeSet.Spec.Replicas == 1 {
-			nodeRange = fmt.Sprintf("%s-0", nodeSet.Name)
-		} else {
-			nodeRange = fmt.Sprintf("%s-[0-%d]", nodeSet.Name, nodeSet.Spec.Replicas-1)
-		}
+		nodeRange := nodeSetHostlist(nodeSet.Name, nodeSet.Spec.Replicas)
 
 		nodeAddr := fmt.Sprintf(
 			"%s.%s",
@@ -338,6 +341,9 @@ func generateSlurmConfig(cluster *values.SlurmCluster) renderutils.ConfigFile {
 	res.AddProperty("MailProg", "/usr/bin/true")
 	res.AddProperty("PluginDir", "/usr/lib/"+consts.Slurm)
 	res.AddProperty("ProctrackType", "proctrack/cgroup")
+	if cluster.JobTmpfsEnabled {
+		res.AddProperty("NamespaceType", "namespace/linux")
+	}
 	res.AddProperty("ReturnToService", 2)
 	res.AddComment("")
 
@@ -580,11 +586,7 @@ func buildSuspendExcNodes(cluster *values.SlurmCluster) string {
 			continue
 		}
 
-		if nodeSet.Spec.Replicas == 1 {
-			staticNodeSets = append(staticNodeSets, fmt.Sprintf("%s-0", nodeSet.Name))
-		} else {
-			staticNodeSets = append(staticNodeSets, fmt.Sprintf("%s-[0-%d]", nodeSet.Name, nodeSet.Spec.Replicas-1))
-		}
+		staticNodeSets = append(staticNodeSets, nodeSetHostlist(nodeSet.Name, nodeSet.Spec.Replicas))
 	}
 
 	return strings.Join(staticNodeSets, ",")

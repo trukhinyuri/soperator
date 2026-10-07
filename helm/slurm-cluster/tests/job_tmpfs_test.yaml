@@ -1,0 +1,25 @@
+suite: test jobTmpfs rendering
+templates:
+  - templates/slurm-cluster-cr.yaml
+tests:
+  - it: should enable per-job tmpfs mounts by default
+    asserts:
+      - equal:
+          path: spec.jobTmpfs.enabled
+          value: true
+
+  - it: should render disabled per-job tmpfs mounts
+    set:
+      jobTmpfs:
+        enabled: false
+    asserts:
+      - equal:
+          path: spec.jobTmpfs.enabled
+          value: false
+
+  - it: should leave the CRD default when the values block is removed
+    set:
+      jobTmpfs: null
+    asserts:
+      - notExists:
+          path: spec.jobTmpfs

@@ -229,6 +229,12 @@ pamSlurmAdopt:
   enabled: false
   exemptUsers: []
   exemptGroups: []
+# Per-job tmpfs mounts at /tmp, /dev/shm and /mnt/memory created through Slurm job namespaces.
+# Their memory is charged to the job cgroup, and Slurm removes them when the job ends.
+# NodeSet jailSubMounts at or below these paths are rejected while this is enabled.
+# When disabled, jobs see the same worker directories as SSH sessions.
+jobTmpfs:
+  enabled: true
 mpiConfig:
   pmixEnv: "OMPI_MCA_btl_tcp_if_include=eth0"
 plugStackConfig:
@@ -859,8 +865,11 @@ slurmScripts:
       enabled: true
       customContent: null
       customConfig: null
+    # Cleans the worker-wide /dev/shm around jobs that allocate the whole node.
+    # Enable when Docker is enabled on workers: containers started with --ipc=host
+    # share it, and their segments outlive the job.
     drop_posix_shmem.sh:
-      enabled: true
+      enabled: false
       customContent: null
       customConfig: null
     gpu_health_check.py:
@@ -872,18 +881,6 @@ slurmScripts:
       customContent: null
       customConfig: null
     idle_mem_used.undrain.py:
-      enabled: true
-      customContent: null
-      customConfig: null
-    job_tmpfs_delete.sh:
-      enabled: true
-      customContent: null
-      customConfig: null
-    job_tmpfs_delete_leftover.sh:
-      enabled: true
-      customContent: null
-      customConfig: null
-    job_tmpfs_recreate.sh:
       enabled: true
       customContent: null
       customConfig: null

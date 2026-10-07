@@ -35,8 +35,34 @@ func TestKubectlClientSlurmCluster(t *testing.T) {
 		AccountingEnabled:    true,
 		LoginDockerEnabled:   true,
 		PAMSlurmAdoptEnabled: true,
+		JobTmpfsEnabled:      true,
 		CustomSlurmConfig:    &customConfig,
 	}, cluster)
+}
+
+func TestKubectlClientSlurmClusterJobTmpfs(t *testing.T) {
+	for _, tc := range []struct {
+		spec    string
+		enabled bool
+	}{
+		{spec: ``, enabled: true},
+		{spec: `"jobTmpfs": {}`, enabled: true},
+		{spec: `"jobTmpfs": {"enabled": true}`, enabled: true},
+		{spec: `"jobTmpfs": {"enabled": false}`, enabled: false},
+	} {
+		t.Run(tc.spec, func(t *testing.T) {
+			exec := &kubectlClientTestExec{kubectl: map[string]string{
+				"get\x00slurmcluster\x00soperator\x00-n\x00soperator\x00-o\x00json": fmt.Sprintf(`{
+					"metadata": {"name": "soperator", "namespace": "soperator"},
+					"spec": {%s}
+				}`, tc.spec),
+			}}
+
+			cluster, err := NewKubectlClient(exec).SlurmCluster(t.Context(), "soperator")
+			require.NoError(t, err)
+			assert.Equal(t, tc.enabled, cluster.JobTmpfsEnabled)
+		})
+	}
 }
 
 func TestKubectlClientSlurmClusterPAMSlurmAdoptDisabled(t *testing.T) {

@@ -55,6 +55,7 @@ type SlurmClusterSpec struct {
 	SlurmNodes             SlurmClusterNodes      `json:"slurmNodes"`
 	CustomSlurmConfig      *string                `json:"customSlurmConfig"`
 	PAMSlurmAdopt          SlurmClusterPAMAdopt   `json:"pamSlurmAdopt"`
+	JobTmpfs               *SlurmClusterJobTmpfs  `json:"jobTmpfs"`
 }
 
 type SlurmClusterNodes struct {
@@ -76,6 +77,10 @@ type SlurmClusterLoginDocker struct {
 
 type SlurmClusterPAMAdopt struct {
 	Enabled bool `json:"enabled"`
+}
+
+type SlurmClusterJobTmpfs struct {
+	Enabled *bool `json:"enabled"`
 }
 
 type SlurmClusterTopology struct {
