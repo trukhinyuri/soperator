@@ -2,7 +2,9 @@ package sharedsteps
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -11,6 +13,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/nebius/soperator/e2e/acceptance/framework"
 	"github.com/nebius/soperator/e2e/acceptance/internal/kubeobjects"
@@ -19,11 +22,12 @@ import (
 const (
 	workerRolloutAnnotationKey  = "slurm.nebius.ai/e2e-rollout"
 	workerRolloutJobName        = "e2e-worker-rolling-update"
-	workerRolloutJobSleep       = 180 * time.Second
+	workerRolloutJobGateTimeout = time.Hour
+	workerRolloutHandoffTimeout = 5 * time.Minute
 	workerRolloutIdleTimeout    = 4 * time.Minute
 	workerRolloutDaemonSetWait  = 10 * time.Minute
 	workerRolloutJobStartWait   = 5 * time.Minute
-	workerRolloutJobFinishWait  = workerRolloutJobSleep + 4*time.Minute
+	workerRolloutJobFinishWait  = 5 * time.Minute
 	workerRolloutReplaceBase    = 3 * time.Minute
 	workerRolloutReplacePerPod  = 6 * time.Minute
 	workerRolloutStuckMargin    = 90 * time.Second
@@ -39,16 +43,23 @@ type WorkerRollingUpdate struct {
 	selector *framework.WorkerSelector
 
 	nodeSet         kubeobjects.NodeSet
+	workerNames     []string
 	workers         []framework.WorkerInfo
 	initialPods     map[string]workerPodSnapshot
 	annotationValue string
 	job             framework.SbatchJob
+	jobReleasePath  string
+	rolloutBudget   int
+	health          workerRolloutHealth
+	mk8s            workerRolloutMK8s
+	power           workerRolloutPower
 }
 
 type workerPodSnapshot struct {
-	UID       types.UID
-	NodeName  string
-	StartTime time.Time
+	UID               types.UID
+	NodeName          string
+	StartTime         time.Time
+	SlurmdContainerID string
 }
 
 func NewWorkerRollingUpdate(
@@ -68,18 +79,22 @@ func NewWorkerRollingUpdate(
 }
 
 func (s *WorkerRollingUpdate) RegisterSteps(sc *godog.ScenarioContext) {
-	sc.Step(`^a ready GPU NodeSet with slurm-aware rolling update is selected$`, s.selectNodeSet)
+	sc.Step(`^a ready GPU NodeSet with active workers and slurm-aware rolling update is selected$`, s.selectNodeSet)
 	sc.Step(`^the Soperator system components have been upgraded since the workers started$`, s.upgradeSystemComponents)
 	sc.Step(`^a test job is running on one of its workers$`, s.submitJobOnWorker)
 	sc.Step(`^the worker template of the NodeSet is changed$`, s.changeWorkerTemplate)
+	sc.Step(`^the worker handoff has started while the test job is running$`, s.waitForWorkerHandoff)
 	sc.Step(`^the running job finishes without being killed$`, s.waitForJobCompleted)
-	sc.Step(`^every worker pod of the NodeSet is replaced within the rollout budget$`, s.waitForWorkersReplaced)
-	sc.Step(`^all workers of the NodeSet are idle with no leftover drain reason$`, s.waitForWorkersIdle)
+	sc.Step(`^every active worker pod of the NodeSet is replaced within the rollout budget$`, s.waitForWorkersReplaced)
+	sc.Step(`^all active workers of the NodeSet are idle with no leftover drain reason$`, s.waitForWorkersIdle)
 	sc.Step(`^the updated NodeSet accepts a targeted smoke job$`, s.runSmokeJobs)
+	s.registerHealthSteps(sc)
+	s.registerMK8sSteps(sc)
 }
 
-// CleanupAndReset only cancels a leftover job. The template annotation is kept on purpose: reverting it
-// would start a second full rollout, and every run writes a fresh value anyway.
+// CleanupAndReset removes temporary jobs, health failures, and suspension holds.
+// Worker template annotations and MK8s max_pods changes are intentionally retained
+// to avoid a second rollout. Each run selects a new annotation or max_pods value.
 func (s *WorkerRollingUpdate) CleanupAndReset(ctx context.Context) {
 	if !s.job.IsZero() {
 		cleanupCtx, cancel := context.WithTimeout(ctx, workerRolloutCleanupTimeout)
@@ -87,12 +102,31 @@ func (s *WorkerRollingUpdate) CleanupAndReset(ctx context.Context) {
 			s.runtime.Logf("cleanup: cancel rolling update job %s: %v", s.job.ID, err)
 		}
 		cancel()
+	} else if s.job.JobName != "" {
+		// Submission may succeed even if its response (and therefore job ID) is lost.
+		cleanupCtx, cancel := context.WithTimeout(ctx, workerRolloutCleanupTimeout)
+		if _, err := s.runtime.Controller().Run(cleanupCtx, "scancel --name="+framework.ShellQuote(s.job.JobName)); err != nil {
+			s.runtime.Logf("Cleanup: cancel rollout job named %s: %v", s.job.JobName, err)
+		}
+		cancel()
 	}
+	s.cleanupHealth(ctx)
+	s.cleanupEphemeralWorkerHold(ctx)
+	if s.jobReleasePath != "" {
+		if _, err := s.runtime.Jail().Run(ctx, "rm -f -- "+framework.ShellQuote(s.jobReleasePath)); err != nil {
+			s.runtime.Logf("Cleanup: remove rollout gate %s: %v", s.jobReleasePath, err)
+		}
+	}
+
+	s.mk8s = workerRolloutMK8s{}
 	s.nodeSet = kubeobjects.NodeSet{}
+	s.workerNames = nil
 	s.workers = nil
 	s.initialPods = nil
 	s.annotationValue = ""
 	s.job = framework.SbatchJob{}
+	s.jobReleasePath = ""
+	s.rolloutBudget = 0
 }
 
 func (s *WorkerRollingUpdate) selectNodeSet(ctx context.Context) error {
@@ -106,43 +140,76 @@ func (s *WorkerRollingUpdate) selectNodeSet(ctx context.Context) error {
 
 	var rejected []string
 	for _, nodeSet := range nodeSets.Items {
-		if reason := workerRolloutCandidateProblem(nodeSet, s.info.SlurmClusterName); reason != "" {
+		if reason := workerRolloutConfigurationProblem(nodeSet, s.info.SlurmClusterName); reason != "" {
 			rejected = append(rejected, fmt.Sprintf("%s: %s", nodeSet.Metadata.Name, reason))
 			continue
 		}
+		names, err := s.rolloutWorkerNames(ctx, nodeSet)
+		if err != nil {
+			return err
+		}
+		if reason := workerRolloutCandidateProblem(nodeSet, s.info.SlurmClusterName, len(names)); reason != "" {
+			return fmt.Errorf("require configured rollout NodeSet %s to be healthy: %s", nodeSet.Metadata.Name, reason)
+		}
+		if len(names) == 0 {
+			rejected = append(rejected, nodeSet.Metadata.Name+": no active workers")
+			continue
+		}
 		s.nodeSet = nodeSet
+		s.workerNames = names
 		break
 	}
 	if s.nodeSet.Metadata.Name == "" {
-		s.runtime.Logf("acceptance: no ready static GPU NodeSet with %s was found (%s), skipping scenario",
+		s.runtime.Logf("acceptance: no ready GPU NodeSet with active workers and %s was found (%s), skipping scenario",
 			kubeobjects.NodeSetUpdateStrategySlurmAwareRollingUpdate, strings.Join(rejected, "; "))
 		return godog.ErrSkip
 	}
 
+	budget, err := workerRolloutBudget(s.nodeSet.Spec.MaxUnavailable, len(s.workerNames))
+	if err != nil {
+		return fmt.Errorf("read NodeSet %s rollout budget: %w", s.nodeSet.Metadata.Name, err)
+	}
+	s.rolloutBudget = budget
+	if isEphemeralRollout(s.nodeSet) {
+		if err := s.holdEphemeralWorkers(ctx, s.workerNames); err != nil {
+			return err
+		}
+		if err := s.checkRolloutWorkerSet(ctx); err != nil {
+			return err
+		}
+	}
 	pods, err := s.nodeSetPods(ctx)
 	if err != nil {
 		return err
 	}
-	if int32(len(pods)) != s.nodeSet.Spec.Replicas {
-		return fmt.Errorf("NodeSet %s has %d worker pods, expected %d", s.nodeSet.Metadata.Name, len(pods), s.nodeSet.Spec.Replicas)
+	if err := requireRolloutPodNames(s.workerNames, pods); err != nil {
+		return fmt.Errorf("check NodeSet %s active pods: %w", s.nodeSet.Metadata.Name, err)
 	}
 	s.initialPods = make(map[string]workerPodSnapshot, len(pods))
 	for _, pod := range pods {
-		if !kubeobjects.PodReady(pod) || pod.DeletionTimestamp != nil || pod.Status.StartTime == nil {
+		if !kubeobjects.PodReady(pod) || pod.DeletionTimestamp != nil || pod.Status.StartTime == nil || pod.UID == "" || pod.Spec.NodeName == "" {
 			return fmt.Errorf("worker pod %s is not a running ready pod: phase=%s deletionTimestamp=%v", pod.Name, pod.Status.Phase, pod.DeletionTimestamp)
 		}
-		s.initialPods[pod.Name] = workerPodSnapshot{UID: pod.UID, NodeName: pod.Spec.NodeName, StartTime: pod.Status.StartTime.Time}
+		snapshot := workerPodSnapshot{UID: pod.UID, NodeName: pod.Spec.NodeName, StartTime: pod.Status.StartTime.Time}
+		for _, container := range pod.Status.ContainerStatuses {
+			if container.Name == "slurmd" {
+				snapshot.SlurmdContainerID = container.ContainerID
+			}
+		}
+		s.initialPods[pod.Name] = snapshot
 	}
 
 	snapshot, err := s.selector.Snapshot(ctx)
 	if err != nil {
 		return err
 	}
-	s.workers = append([]framework.WorkerInfo(nil), snapshot.WorkersByNodeSet[s.nodeSet.Metadata.Name]...)
-	sort.Slice(s.workers, func(i, j int) bool { return s.workers[i].Name < s.workers[j].Name })
-	if int32(len(s.workers)) != s.nodeSet.Spec.Replicas {
-		return fmt.Errorf("NodeSet %s has %d Slurm workers in the main partition, expected %d",
-			s.nodeSet.Metadata.Name, len(s.workers), s.nodeSet.Spec.Replicas)
+	pool := snapshot.WorkersByNodeSet[s.nodeSet.Metadata.Name]
+	if !isEphemeralRollout(s.nodeSet) && len(pool) != len(s.workerNames) {
+		return fmt.Errorf("NodeSet %s has %d Slurm workers in the main partition, expected %d", s.nodeSet.Metadata.Name, len(pool), len(s.workerNames))
+	}
+	s.workers, err = selectRolloutWorkers(s.workerNames, pool)
+	if err != nil {
+		return fmt.Errorf("select NodeSet %s active Slurm workers: %w", s.nodeSet.Metadata.Name, err)
 	}
 	return s.waitForIdle(ctx, "selected NodeSet workers idle before the rollout")
 }
@@ -206,11 +273,22 @@ func (s *WorkerRollingUpdate) submitJobOnWorker(ctx context.Context) error {
 	if len(s.workers) == 0 {
 		return fmt.Errorf("select a NodeSet before submitting the job")
 	}
+	if err := s.checkRolloutWorkerSet(ctx); err != nil {
+		return err
+	}
 	worker := s.workers[0]
+	gateDir := framework.AcceptanceJobOutputDir
+	if artifacts, ok := framework.ScenarioArtifacts(ctx); ok {
+		gateDir = artifacts.JailDir
+	}
+	s.jobReleasePath = path.Join(gateDir, fmt.Sprintf("worker-rollout-%d.release", time.Now().UnixNano()))
+	s.job = framework.SbatchJob{JobName: fmt.Sprintf("%s-%d", workerRolloutJobName, time.Now().UnixNano())}
 	opts := framework.SbatchOptions{
-		JobName:    workerRolloutJobName,
-		ExtraFlags: []string{fmt.Sprintf("-w %s", framework.ShellQuote(worker.Name))},
-		Wrap:       fmt.Sprintf("sleep %.0f", workerRolloutJobSleep.Seconds()),
+		JobName:    s.job.JobName,
+		Nodelist:   []string{worker.Name},
+		Nodes:      1,
+		ExtraFlags: []string{"--no-requeue", "--time=65", "--cpus-per-task=1", "--mem=128M"},
+		Wrap:       rolloutJobGate(s.jobReleasePath, workerRolloutJobGateTimeout),
 	}
 	if s.nodeSet.Spec.GPU.Enabled {
 		opts.GPUsPerNode = 1
@@ -225,7 +303,10 @@ func (s *WorkerRollingUpdate) submitJobOnWorker(ctx context.Context) error {
 }
 
 func (s *WorkerRollingUpdate) changeWorkerTemplate(ctx context.Context) error {
-	s.annotationValue = time.Now().UTC().Format("20060102T150405Z")
+	if err := s.checkRolloutWorkerSet(ctx); err != nil {
+		return err
+	}
+	s.annotationValue = fmt.Sprintf("%d", time.Now().UnixNano())
 	patch := fmt.Sprintf(`{"spec":{"workerAnnotations":{%q:%q}}}`, workerRolloutAnnotationKey, s.annotationValue)
 	if _, err := s.runtime.Kubectl().RunWithDefaultRetry(ctx,
 		"patch", "nodeset", s.nodeSet.Metadata.Name, "-n", s.nodeSet.Metadata.Namespace,
@@ -239,8 +320,14 @@ func (s *WorkerRollingUpdate) waitForJobCompleted(ctx context.Context) error {
 	if s.job.IsZero() {
 		return fmt.Errorf("submit the job before waiting for its completion")
 	}
+	if err := s.assertRolloutJobRunning(ctx); err != nil {
+		return framework.AnnotateWithJobLog(ctx, s.runtime, s.slurm, s.job, err)
+	}
+	if _, err := s.runtime.Jail().Run(ctx, "touch -- "+framework.ShellQuote(s.jobReleasePath)); err != nil {
+		return fmt.Errorf("release rollout job %s: %w", s.job.ID, err)
+	}
 	var fatal error
-	err := s.runtime.WaitFor(ctx, fmt.Sprintf("job %s completed", s.job.ID), workerRolloutJobFinishWait, framework.DefaultPollInterval,
+	err := s.waitForRollout(ctx, fmt.Sprintf("job %s completed", s.job.ID), workerRolloutJobFinishWait, framework.DefaultPollInterval,
 		func(waitCtx context.Context) (bool, error) {
 			info, err := s.slurm.JobInfo(waitCtx, s.job.ID)
 			if err != nil {
@@ -252,7 +339,7 @@ func (s *WorkerRollingUpdate) waitForJobCompleted(ctx context.Context) error {
 				return true, nil
 			}
 			if !done {
-				return false, fmt.Errorf("job %s state=%q sacct=%q", s.job.ID, info.QueueState, info.SacctState)
+				return false, fmt.Errorf("job %s state=%q sacct=%q restarts=%v", s.job.ID, info.QueueState, info.SacctState, info.Restarts)
 			}
 			return true, nil
 		})
@@ -262,15 +349,14 @@ func (s *WorkerRollingUpdate) waitForJobCompleted(ctx context.Context) error {
 	if err != nil {
 		return framework.AnnotateWithJobLog(ctx, s.runtime, s.slurm, s.job, err)
 	}
-	s.job = framework.SbatchJob{}
 	return nil
 }
 
 func (s *WorkerRollingUpdate) waitForWorkersReplaced(ctx context.Context) error {
-	timeout := workerRolloutReplaceBase + time.Duration(s.nodeSet.Spec.Replicas)*workerRolloutReplacePerPod
+	timeout := workerRolloutReplaceBase + time.Duration(len(s.initialPods))*workerRolloutReplacePerPod
 	var fatal error
 	var lastProgress string
-	err := s.runtime.WaitFor(ctx, fmt.Sprintf("NodeSet %s worker pods replaced", s.nodeSet.Metadata.Name), timeout, framework.DefaultPollInterval,
+	err := s.waitForRollout(ctx, fmt.Sprintf("NodeSet %s worker pods replaced", s.nodeSet.Metadata.Name), timeout, framework.DefaultPollInterval,
 		func(waitCtx context.Context) (bool, error) {
 			pods, err := s.nodeSetPods(waitCtx)
 			if err != nil {
@@ -284,7 +370,7 @@ func (s *WorkerRollingUpdate) waitForWorkersReplaced(ctx context.Context) error 
 					return true, nil
 				}
 			}
-			remaining := replacedWorkerPods(s.nodeSet.Metadata.Name, s.initialPods, pods, s.nodeSet.Spec.Replicas, workerRolloutAnnotationKey, s.annotationValue)
+			remaining := replacedWorkerPods(s.initialPods, pods, s.annotationValue)
 			if len(remaining) == 0 {
 				return true, nil
 			}
@@ -308,6 +394,9 @@ func (s *WorkerRollingUpdate) waitForWorkersIdle(ctx context.Context) error {
 func (s *WorkerRollingUpdate) runSmokeJobs(ctx context.Context) error {
 	var problems []string
 	for _, worker := range s.workers {
+		if err := s.checkRolloutWorkerSet(ctx); err != nil {
+			return err
+		}
 		command := fmt.Sprintf("timeout %.0f srun -w %s hostname", workerRolloutSmokeTimeout.Seconds(), framework.ShellQuote(worker.Name))
 		if s.nodeSet.Spec.GPU.Enabled {
 			command = fmt.Sprintf("timeout %.0f srun -w %s --gpus-per-node=1 nvidia-smi -L >/dev/null",
@@ -324,11 +413,11 @@ func (s *WorkerRollingUpdate) runSmokeJobs(ctx context.Context) error {
 		sort.Strings(problems)
 		return fmt.Errorf("%s", strings.Join(problems, "; "))
 	}
-	return nil
+	return s.checkRolloutWorkerSet(ctx)
 }
 
 func (s *WorkerRollingUpdate) waitForIdle(ctx context.Context, description string) error {
-	return s.runtime.WaitFor(ctx, description, workerRolloutIdleTimeout, framework.DefaultPollInterval,
+	return s.waitForRollout(ctx, description, workerRolloutIdleTimeout, framework.DefaultPollInterval,
 		func(waitCtx context.Context) (bool, error) {
 			nodes := make([]framework.SlurmNodeInfo, 0, len(s.workers))
 			for _, worker := range s.workers {
@@ -364,7 +453,17 @@ func (s *WorkerRollingUpdate) systemDaemonSets(ctx context.Context) ([]appsv1.Da
 }
 
 // workerRolloutCandidateProblem explains why a NodeSet cannot drive the scenario, or returns "" for a fit.
-func workerRolloutCandidateProblem(nodeSet kubeobjects.NodeSet, clusterName string) string {
+func workerRolloutCandidateProblem(nodeSet kubeobjects.NodeSet, clusterName string, activeCount int) string {
+	if reason := workerRolloutConfigurationProblem(nodeSet, clusterName); reason != "" {
+		return reason
+	}
+	if int(nodeSet.Status.Replicas) != activeCount || nodeSet.Status.Phase != kubeobjects.NodeSetPhaseReady {
+		return fmt.Sprintf("phase=%s ready=%d/%d", nodeSet.Status.Phase, nodeSet.Status.Replicas, activeCount)
+	}
+	return ""
+}
+
+func workerRolloutConfigurationProblem(nodeSet kubeobjects.NodeSet, clusterName string) string {
 	switch {
 	case nodeSet.Spec.ClusterName != "" && nodeSet.Spec.ClusterName != clusterName:
 		return "belongs to another cluster"
@@ -372,12 +471,8 @@ func workerRolloutCandidateProblem(nodeSet kubeobjects.NodeSet, clusterName stri
 		return "no GPU"
 	case nodeSet.Spec.UpdateStrategy != kubeobjects.NodeSetUpdateStrategySlurmAwareRollingUpdate:
 		return fmt.Sprintf("updateStrategy=%q", nodeSet.Spec.UpdateStrategy)
-	case nodeSet.Spec.EphemeralNodes != nil && *nodeSet.Spec.EphemeralNodes:
-		return "ephemeral mode"
 	case nodeSet.Spec.Replicas == 0:
 		return "no replicas"
-	case nodeSet.Status.Replicas != nodeSet.Spec.Replicas || nodeSet.Status.Phase != kubeobjects.NodeSetPhaseReady:
-		return fmt.Sprintf("phase=%s ready=%d/%d", nodeSet.Status.Phase, nodeSet.Status.Replicas, nodeSet.Spec.Replicas)
 	}
 	return ""
 }
@@ -401,13 +496,12 @@ func podTerminatingPastDeadline(pod corev1.Pod, now time.Time) (past bool, termi
 }
 
 // replacedWorkerPods lists the ordinals that are not yet replaced by a ready pod carrying the new template.
-func replacedWorkerPods(nodeSetName string, initial map[string]workerPodSnapshot, pods []corev1.Pod, replicas int32, annotationKey, annotationValue string) (remaining []string) {
+func replacedWorkerPods(initial map[string]workerPodSnapshot, pods []corev1.Pod, annotationValue string) (remaining []string) {
 	byName := make(map[string]corev1.Pod, len(pods))
 	for _, pod := range pods {
 		byName[pod.Name] = pod
 	}
-	for ordinal := range replicas {
-		name := fmt.Sprintf("%s-%d", nodeSetName, ordinal)
+	for name := range initial {
 		pod, ok := byName[name]
 		switch {
 		case !ok:
@@ -416,12 +510,13 @@ func replacedWorkerPods(nodeSetName string, initial map[string]workerPodSnapshot
 			remaining = append(remaining, name+" (old pod)")
 		case pod.DeletionTimestamp != nil:
 			remaining = append(remaining, name+" (terminating)")
-		case pod.Annotations[annotationKey] != annotationValue:
+		case pod.Annotations[workerRolloutAnnotationKey] != annotationValue:
 			remaining = append(remaining, name+" (old template)")
 		case !kubeobjects.PodReady(pod):
 			remaining = append(remaining, fmt.Sprintf("%s (%s, not ready)", name, pod.Status.Phase))
 		}
 	}
+	sort.Strings(remaining)
 	return remaining
 }
 
@@ -459,7 +554,10 @@ func ownedByDaemonSet(pod corev1.Pod) bool {
 func idleProblems(nodes []framework.SlurmNodeInfo) []string {
 	var problems []string
 	for _, node := range nodes {
-		if !node.HasStateFlag("IDLE") || !node.IsUsable() || node.Reason != "" {
+		if !node.HasStateFlag("IDLE") || !node.IsUsable() || node.Reason != "" ||
+			node.HasStateFlag("COMPLETING") || node.HasStateFlag("REBOOT_REQUESTED") || node.HasStateFlag("REBOOT_ISSUED") ||
+			node.HasStateFlag("POWER_DOWN") || node.HasStateFlag("POWERING_DOWN") || node.HasStateFlag("POWERED_DOWN") ||
+			node.HasStateFlag("POWER_UP") || node.HasStateFlag("POWERING_UP") {
 			problems = append(problems, fmt.Sprintf("%s state=%s reason=%q", node.Name, node.State, node.Reason))
 		}
 	}
@@ -468,11 +566,118 @@ func idleProblems(nodes []framework.SlurmNodeInfo) []string {
 
 // jobOutcome reports whether the job reached a terminal state; a non-empty failure means it did not complete cleanly.
 func jobOutcome(info framework.SlurmJobInfo) (done bool, failure string) {
+	if info.Restarts != nil && *info.Restarts > 0 {
+		return true, fmt.Sprintf("job %s restarted %d times", info.ID, *info.Restarts)
+	}
 	if info.IsAlive() || !info.SacctFound {
 		return false, ""
 	}
 	if !info.CompletedSuccessfully() {
 		return true, fmt.Sprintf("job %s ended in state %s with exit code %s", info.ID, info.SacctState, info.SacctExit)
 	}
+	if !info.HasNoRestarts() {
+		return false, ""
+	}
 	return true, ""
+}
+
+func rolloutJobGate(releasePath string, timeout time.Duration) string {
+	return fmt.Sprintf("timeout %.0fs sh -c %s", timeout.Seconds(), framework.ShellQuote(
+		"while [ ! -f "+framework.ShellQuote(releasePath)+" ]; do sleep 1; done"))
+}
+
+func workerRolloutBudget(value *intstr.IntOrString, replicas int) (int, error) {
+	if replicas < 1 {
+		return 0, fmt.Errorf("require positive worker replica count, got %d", replicas)
+	}
+	if value == nil {
+		return 1, nil
+	}
+	budget, err := intstr.GetScaledValueFromIntOrPercent(value, replicas, false)
+	if err != nil {
+		return 0, fmt.Errorf("parse maxUnavailable %q: %w", value.String(), err)
+	}
+	return min(replicas, max(1, budget)), nil
+}
+
+type rolloutInvariantError struct{ error }
+
+func rolloutInvariant(format string, args ...any) error {
+	return rolloutInvariantError{fmt.Errorf(format, args...)}
+}
+
+// WaitFor retries transient errors; an observed safety violation must survive later recovery.
+func (s *WorkerRollingUpdate) waitForRollout(ctx context.Context, description string, timeout, interval time.Duration, condition func(context.Context) (bool, error)) error {
+	var fatal error
+	err := s.runtime.WaitFor(ctx, description, timeout, interval, func(waitCtx context.Context) (bool, error) {
+		err := s.observeRollout(waitCtx)
+		var done bool
+		if err == nil {
+			done, err = condition(waitCtx)
+		}
+		var invariant rolloutInvariantError
+		if errors.As(err, &invariant) {
+			fatal = err
+			return true, nil
+		}
+		return done, err
+	})
+	if fatal != nil {
+		return fatal
+	}
+	return err
+}
+
+func (s *WorkerRollingUpdate) assertRolloutJobRunning(ctx context.Context) error {
+	info, err := s.slurm.JobInfo(ctx, s.job.ID)
+	if err != nil {
+		return err
+	}
+	if info.QueueState == "" && (!info.SacctFound || info.IsAlive()) {
+		return fmt.Errorf("read current queue state for rollout job %s (accounting=%s)", s.job.ID, info.SacctState)
+	}
+	if info.QueueState != "RUNNING" || (info.Restarts != nil && *info.Restarts > 0) {
+		return rolloutInvariant("rollout job %s must remain RUNNING without restarts: state=%s accounting=%s restarts=%v", s.job.ID, info.QueueState, info.SacctState, info.Restarts)
+	}
+	if !info.HasNoRestarts() {
+		return fmt.Errorf("read restart count for rollout job %s", s.job.ID)
+	}
+	return nil
+}
+
+func (s *WorkerRollingUpdate) waitForWorkerHandoff(ctx context.Context) error {
+	worker := s.workers[0]
+	initial := s.initialPods[worker.Name]
+	err := s.waitForRollout(ctx, "worker handoff waits for the running job", workerRolloutHandoffTimeout, framework.DefaultPollInterval,
+		func(waitCtx context.Context) (bool, error) {
+			if err := s.assertRolloutJobRunning(waitCtx); err != nil {
+				return false, err
+			}
+			pods, err := s.nodeSetPods(waitCtx)
+			if err != nil {
+				return false, err
+			}
+			for _, pod := range pods {
+				if pod.Name != worker.Name {
+					continue
+				}
+				if pod.UID != initial.UID || pod.Spec.NodeName != initial.NodeName || pod.DeletionTimestamp != nil {
+					return false, rolloutInvariant("worker %s moved before job completion: pod=%s host=%s deletion=%v", worker.Name, pod.UID, pod.Spec.NodeName, pod.DeletionTimestamp)
+				}
+				node, err := s.slurm.NodeInfoOnce(waitCtx, worker.Name)
+				if err != nil {
+					return false, err
+				}
+				if pod.Labels["slurm.nebius.ai/worker-operation-phase"] == "stopping" &&
+					pod.Labels["slurm.nebius.ai/worker-operation-id"] != "" && node.HasStateFlag("REBOOT_REQUESTED") {
+					return true, nil
+				}
+				return false, fmt.Errorf("worker %s has phase=%s Slurm state=%s reason=%q", worker.Name, pod.Labels["slurm.nebius.ai/worker-operation-phase"], node.State, node.Reason)
+			}
+			return false, rolloutInvariant("worker %s disappeared while job %s was running", worker.Name, s.job.ID)
+		})
+	if err != nil {
+		return framework.AnnotateWithJobLog(ctx, s.runtime, s.slurm, s.job, err)
+	}
+	return nil
 }

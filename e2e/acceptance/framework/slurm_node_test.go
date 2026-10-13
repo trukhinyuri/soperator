@@ -39,6 +39,26 @@ func TestParseSlurmNodeInfoLeavesInvalidStartTimeUnset(t *testing.T) {
 	}
 }
 
+func TestParseSlurmNodeAllocations(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		output      string
+		cpu, memory *uint64
+	}{
+		{"idle", "CPUAlloc=0 AllocMem=0", new(uint64(0)), new(uint64(0))},
+		{"allocated", "CPUAlloc=2 AllocMem=128", new(uint64(2)), new(uint64(128))},
+		{"missing", "State=IDLE", nil, nil},
+		{"invalid", "CPUAlloc=N/A AllocMem=0bad", nil, nil},
+		{"negative", "CPUAlloc=-1 AllocMem=-1", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := ParseSlurmNodeInfo("worker-0", tc.output)
+			assert.Equal(t, tc.cpu, info.CPUAlloc)
+			assert.Equal(t, tc.memory, info.AllocMemoryMiB)
+		})
+	}
+}
+
 func TestParseSlurmNodeInfoGPUCount(t *testing.T) {
 	for _, test := range []struct {
 		name     string

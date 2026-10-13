@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 const (
@@ -146,12 +147,13 @@ type NodeSet struct {
 }
 
 type NodeSetSpec struct {
-	ClusterName                 string         `json:"clusterName"`
-	Replicas                    int32          `json:"replicas"`
-	EphemeralNodes              *bool          `json:"ephemeralNodes"`
-	InitialNumberEphemeralNodes int32          `json:"initialNumberEphemeralNodes"`
-	GPU                         NodeSetGPUSpec `json:"gpu"`
-	UpdateStrategy              string         `json:"updateStrategy"`
+	ClusterName                 string              `json:"clusterName"`
+	Replicas                    int32               `json:"replicas"`
+	EphemeralNodes              *bool               `json:"ephemeralNodes"`
+	InitialNumberEphemeralNodes int32               `json:"initialNumberEphemeralNodes"`
+	GPU                         NodeSetGPUSpec      `json:"gpu"`
+	UpdateStrategy              string              `json:"updateStrategy"`
+	MaxUnavailable              *intstr.IntOrString `json:"maxUnavailable"`
 }
 
 type NodeSetGPUSpec struct {

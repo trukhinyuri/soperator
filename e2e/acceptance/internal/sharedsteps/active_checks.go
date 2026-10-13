@@ -11,7 +11,6 @@ import (
 	"github.com/cucumber/godog"
 
 	"github.com/nebius/soperator/e2e/acceptance/framework"
-	"github.com/nebius/soperator/e2e/acceptance/internal/kubeobjects"
 )
 
 const (
@@ -28,6 +27,7 @@ const (
 var activeGPUHealthStatusPattern = regexp.MustCompile(`(?m)^Health checker status:\s*(\S+)\s*$`)
 
 type ActiveChecks struct {
+	*activeCheckJobs
 	info     *framework.ClusterInfo
 	runtime  framework.Runtime
 	slurm    *framework.SlurmClient
@@ -41,11 +41,12 @@ type ActiveChecks struct {
 
 func NewActiveChecks(info *framework.ClusterInfo, runtime framework.Runtime, slurm *framework.SlurmClient, kubectl *framework.KubectlClient, selector *framework.WorkerSelector) *ActiveChecks {
 	return &ActiveChecks{
-		info:     info,
-		runtime:  runtime,
-		slurm:    slurm,
-		kubectl:  kubectl,
-		selector: selector,
+		activeCheckJobs: &activeCheckJobs{clusterName: info.SlurmClusterName, runtime: runtime, kubectl: kubectl},
+		info:            info,
+		runtime:         runtime,
+		slurm:           slurm,
+		kubectl:         kubectl,
+		selector:        selector,
 	}
 }
 
@@ -121,107 +122,7 @@ func (s *ActiveChecks) gpuActiveCheckOutputsReportPASSOnAllGPUWorkers(ctx contex
 }
 
 func (s *ActiveChecks) activeCheckName(suffix string) string {
-	return fmt.Sprintf("%s-%s", s.info.SlurmClusterName, suffix)
-}
-
-func (s *ActiveChecks) createJobFromCronJob(ctx context.Context, cronJobName string) (string, error) {
-	jobName := uniqueK8sJobName(strings.TrimPrefix(cronJobName, s.info.SlurmClusterName+"-"))
-	if _, err := s.runtime.Kubectl().RunWithDefaultRetry(ctx,
-		"create", "job", "-n", framework.SoperatorNamespace,
-		"--from=cronjob/"+cronJobName,
-		jobName,
-	); err != nil {
-		return "", fmt.Errorf("trigger CronJob %s as Job %s: %w", cronJobName, jobName, err)
-	}
-	s.runtime.Logf("active checks: triggered CronJob %s as Job %s", cronJobName, jobName)
-	return jobName, nil
-}
-
-func (s *ActiveChecks) waitForK8sJobSlurmJobIDs(ctx context.Context, jobName string, timeout time.Duration) ([]string, error) {
-	var latest k8sJobStatus
-	err := s.runtime.WaitFor(ctx, fmt.Sprintf("Kubernetes Job %s Slurm job IDs", jobName), timeout, framework.DefaultPollInterval, func(waitCtx context.Context) (bool, error) {
-		var job k8sJobStatus
-		if err := s.kubectl.GetJSON(waitCtx, &job, "get", "job", "-n", framework.SoperatorNamespace, jobName, "-o", "json"); err != nil {
-			return false, err
-		}
-		latest = job
-		if job.Status.Failed > 0 {
-			return false, fmt.Errorf("Kubernetes Job %s failed before Slurm job IDs were recorded: %+v", jobName, job.Status)
-		}
-		return len(slurmJobIDsFromAnnotation(job.Metadata.Annotations)) > 0, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return slurmJobIDsFromAnnotation(latest.Metadata.Annotations), nil
-}
-
-func (s *ActiveChecks) waitForK8sJobCompleteSuccessfully(ctx context.Context, jobName string, timeout time.Duration) error {
-	return s.runtime.WaitFor(ctx, fmt.Sprintf("Kubernetes Job %s complete", jobName), timeout, framework.DefaultPollInterval, func(waitCtx context.Context) (bool, error) {
-		var job k8sJobStatus
-		if err := s.kubectl.GetJSON(waitCtx, &job, "get", "job", "-n", framework.SoperatorNamespace, jobName, "-o", "json"); err != nil {
-			return false, err
-		}
-		if job.Status.Succeeded > 0 {
-			return true, nil
-		}
-		if job.Status.Failed > 0 {
-			return false, fmt.Errorf("Kubernetes Job %s failed: %+v", jobName, job.Status)
-		}
-		return false, nil
-	})
-}
-
-func (s *ActiveChecks) waitForActiveCheckSlurmRunComplete(ctx context.Context, checkName, firstJobID string, timeout time.Duration) error {
-	return s.runtime.WaitFor(ctx, fmt.Sprintf("ActiveCheck %s Slurm run %s complete", checkName, firstJobID), timeout, framework.DefaultPollInterval, func(waitCtx context.Context) (bool, error) {
-		var check kubeobjects.ActiveCheck
-		if err := s.kubectl.GetJSON(waitCtx, &check, "get", "activecheck", "-n", framework.SoperatorNamespace, checkName, "-o", "json"); err != nil {
-			return false, err
-		}
-		status := check.Status.SlurmJobsStatus
-		if status.LastRunID != firstJobID {
-			return false, nil
-		}
-		switch status.LastRunStatus {
-		case kubeobjects.ActiveCheckSlurmRunStatusComplete:
-			return true, nil
-		case kubeobjects.ActiveCheckSlurmRunStatusFailed,
-			kubeobjects.ActiveCheckSlurmRunStatusCancelled,
-			kubeobjects.ActiveCheckSlurmRunStatusError,
-			kubeobjects.ActiveCheckSlurmRunStatusSkipped:
-			return false, fmt.Errorf("ActiveCheck %s finished with status=%s fail_jobs=%+v error_jobs=%+v cancelled_jobs=%v",
-				checkName, status.LastRunStatus, status.LastRunFailJobsAndReasons, status.LastRunErrorJobsAndReasons, status.LastRunCancelledJobs)
-		default:
-			return false, nil
-		}
-	})
-}
-
-func uniqueK8sJobName(prefix string) string {
-	prefix = strings.Trim(strings.ToLower(prefix), "-")
-	if prefix == "" {
-		prefix = "job"
-	}
-	name := fmt.Sprintf("acceptance-%s-%d", prefix, time.Now().Unix())
-	if len(name) <= 63 {
-		return name
-	}
-	return name[:63]
-}
-
-func slurmJobIDsFromAnnotation(annotations map[string]string) []string {
-	raw := strings.TrimSpace(annotations["slurm-job-id"])
-	if raw == "" {
-		return nil
-	}
-	var ids []string
-	for _, part := range strings.Split(raw, ",") {
-		id := strings.TrimSpace(part)
-		if id != "" {
-			ids = append(ids, id)
-		}
-	}
-	return ids
+	return activeCheckResourceName(s.info.SlurmClusterName, suffix)
 }
 
 func (s *ActiveChecks) waitForGPUActiveCheckSlurmJobsCompletedOnAllGPUWorkers(ctx context.Context) error {
@@ -374,16 +275,6 @@ func parseActiveCheckSlurmJobRecords(output string) map[string]activeCheckSlurmJ
 		}
 	}
 	return records
-}
-
-type k8sJobStatus struct {
-	Metadata struct {
-		Annotations map[string]string `json:"annotations"`
-	} `json:"metadata"`
-	Status struct {
-		Succeeded int32 `json:"succeeded"`
-		Failed    int32 `json:"failed"`
-	} `json:"status"`
 }
 
 type activeCheckSlurmJobRecord struct {

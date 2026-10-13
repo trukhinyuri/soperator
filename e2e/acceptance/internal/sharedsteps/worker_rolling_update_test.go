@@ -1,6 +1,9 @@
 package sharedsteps
 
 import (
+	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/nebius/soperator/e2e/acceptance/framework"
 	"github.com/nebius/soperator/e2e/acceptance/internal/kubeobjects"
@@ -42,7 +46,7 @@ func TestWorkerRolloutCandidateProblem(t *testing.T) {
 		},
 		Status: kubeobjects.NodeSetStatus{Phase: kubeobjects.NodeSetPhaseReady, Replicas: 2},
 	}
-	assert.Empty(t, workerRolloutCandidateProblem(ready, "soperator"))
+	assert.Empty(t, workerRolloutCandidateProblem(ready, "soperator", 2))
 
 	tests := []struct {
 		name   string
@@ -52,7 +56,7 @@ func TestWorkerRolloutCandidateProblem(t *testing.T) {
 		{"other cluster", func(n *kubeobjects.NodeSet) { n.Spec.ClusterName = "other" }, "belongs to another cluster"},
 		{"cpu", func(n *kubeobjects.NodeSet) { n.Spec.GPU.Enabled = false }, "no GPU"},
 		{"kruise rolling update", func(n *kubeobjects.NodeSet) { n.Spec.UpdateStrategy = "rollingUpdate" }, `updateStrategy="rollingUpdate"`},
-		{"ephemeral", func(n *kubeobjects.NodeSet) { n.Spec.EphemeralNodes = new(true) }, "ephemeral mode"},
+		{"ephemeral", func(n *kubeobjects.NodeSet) { n.Spec.EphemeralNodes = new(true) }, ""},
 		{"no replicas", func(n *kubeobjects.NodeSet) { n.Spec.Replicas = 0 }, "no replicas"},
 		{"not ready", func(n *kubeobjects.NodeSet) { n.Status.Replicas = 1 }, "phase=Ready ready=1/2"},
 		{"provisioning", func(n *kubeobjects.NodeSet) { n.Status.Phase = "Provisioning" }, "phase=Provisioning ready=2/2"},
@@ -61,7 +65,7 @@ func TestWorkerRolloutCandidateProblem(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			nodeSet := ready
 			tt.mutate(&nodeSet)
-			assert.Equal(t, tt.want, workerRolloutCandidateProblem(nodeSet, "soperator"))
+			assert.Equal(t, tt.want, workerRolloutCandidateProblem(nodeSet, "soperator", 2))
 		})
 	}
 }
@@ -93,10 +97,11 @@ func TestReplacedWorkerPods(t *testing.T) {
 
 	t.Run("all replaced", func(t *testing.T) {
 		pods := []corev1.Pod{readyWorkerPod("worker-0", "new-0", newTemplate), readyWorkerPod("worker-1", "new-1", newTemplate)}
-		assert.Empty(t, replacedWorkerPods("worker", initial, pods, 2, workerRolloutAnnotationKey, "v2"))
+		assert.Empty(t, replacedWorkerPods(initial, pods, "v2"))
 	})
 
 	t.Run("mixed progress", func(t *testing.T) {
+		initial := map[string]workerPodSnapshot{"worker-0": {UID: "old-0"}, "worker-1": {UID: "old-1"}, "worker-2": {UID: "old-2"}, "worker-3": {UID: "old-3"}, "worker-4": {UID: "old-4"}}
 		terminating := readyWorkerPod("worker-1", "new-1", newTemplate)
 		terminating.DeletionTimestamp = new(metav1.Now())
 		notReady := readyWorkerPod("worker-2", "new-2", newTemplate)
@@ -108,7 +113,7 @@ func TestReplacedWorkerPods(t *testing.T) {
 			notReady,
 			readyWorkerPod("worker-3", "new-3", map[string]string{workerRolloutAnnotationKey: "v1"}),
 		}
-		remaining := replacedWorkerPods("worker", initial, pods, 5, workerRolloutAnnotationKey, "v2")
+		remaining := replacedWorkerPods(initial, pods, "v2")
 		assert.Equal(t, []string{
 			"worker-0 (old pod)",
 			"worker-1 (terminating)",
@@ -190,6 +195,9 @@ func TestIdleProblems(t *testing.T) {
 	assert.Contains(t, problems[0], "soperator rolling update")
 	assert.Contains(t, problems[1], "worker-1 state=MIXED")
 	assert.Contains(t, problems[2], "worker-2 state=IDLE")
+	for _, state := range []string{"IDLE+REBOOT_REQUESTED", "IDLE+REBOOT_ISSUED", "IDLE+COMPLETING"} {
+		assert.NotEmpty(t, idleProblems([]framework.SlurmNodeInfo{{Name: "worker-0", State: state}}))
+	}
 }
 
 func TestJobOutcome(t *testing.T) {
@@ -202,7 +210,10 @@ func TestJobOutcome(t *testing.T) {
 		{"running", framework.SlurmJobInfo{QueueState: "RUNNING"}, false, ""},
 		{"completing", framework.SlurmJobInfo{QueueState: "COMPLETING"}, false, ""},
 		{"gone without accounting record yet", framework.SlurmJobInfo{}, false, ""},
-		{"completed", framework.SlurmJobInfo{ID: "7", SacctFound: true, SacctState: "COMPLETED", SacctExit: "0:0"}, true, ""},
+		{"completed", framework.SlurmJobInfo{ID: "7", SacctFound: true, SacctState: "COMPLETED", SacctExit: "0:0", Restarts: new(0)}, true, ""},
+		{"completed after requeue", framework.SlurmJobInfo{ID: "7", SacctFound: true, SacctState: "COMPLETED", SacctExit: "0:0", Restarts: new(1)}, true, "restarted 1 times"},
+		{"completed with unknown restarts", framework.SlurmJobInfo{ID: "7", SacctFound: true, SacctState: "COMPLETED", SacctExit: "0:0"}, false, ""},
+		{"running after restart", framework.SlurmJobInfo{ID: "7", QueueState: "RUNNING", Restarts: new(1)}, true, "restarted 1 times"},
 		{"completed with exit code", framework.SlurmJobInfo{ID: "7", SacctFound: true, SacctState: "COMPLETED", SacctExit: "1:0"}, true, "COMPLETED with exit code 1:0"},
 		{"cancelled by", framework.SlurmJobInfo{ID: "7", SacctFound: true, SacctState: "CANCELLED by 0", SacctExit: "0:15"}, true, "CANCELLED by 0"},
 		{"node fail", framework.SlurmJobInfo{ID: "7", SacctFound: true, SacctState: "NODE_FAIL", SacctExit: "0:0"}, true, "NODE_FAIL"},
@@ -218,4 +229,93 @@ func TestJobOutcome(t *testing.T) {
 			assert.Contains(t, failure, tt.wantFailure)
 		})
 	}
+}
+
+func TestWorkerRolloutBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		value          *intstr.IntOrString
+		replicas, want int
+		wantErr        bool
+	}{
+		{"default", nil, 4, 1, false},
+		{"integer", new(intstr.FromInt(2)), 4, 2, false},
+		{"percentage floors", new(intstr.FromString("50%")), 3, 1, false},
+		{"percentage rounds to zero", new(intstr.FromString("10%")), 3, 1, false},
+		{"clamped to replicas", new(intstr.FromInt(6)), 3, 3, false},
+		{"zero budget follows controller minimum", new(intstr.FromInt(0)), 3, 1, false},
+		{"invalid", new(intstr.FromString("bad")), 3, 0, true},
+		{"empty NodeSet", nil, 0, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := workerRolloutBudget(tc.value, tc.replicas)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestWorkerRolloutUnhealthyConfigurationIsNotOptional(t *testing.T) {
+	nodeSet := kubeobjects.NodeSet{
+		Spec:   kubeobjects.NodeSetSpec{Replicas: 2, GPU: kubeobjects.NodeSetGPUSpec{Enabled: true}, UpdateStrategy: kubeobjects.NodeSetUpdateStrategySlurmAwareRollingUpdate},
+		Status: kubeobjects.NodeSetStatus{Phase: "Provisioning", Replicas: 1},
+	}
+	assert.Empty(t, workerRolloutConfigurationProblem(nodeSet, "soperator"))
+	assert.NotEmpty(t, workerRolloutCandidateProblem(nodeSet, "soperator", 2))
+}
+
+func TestRolloutJobGateQuotesPathAndHasDeadline(t *testing.T) {
+	script := rolloutJobGate("/tmp/a 'job'; exit 1", time.Minute)
+	assert.True(t, strings.HasPrefix(script, "timeout 60s sh -c "))
+	assert.Contains(t, script, "while [ ! -f ")
+	assert.Contains(t, script, "sleep 1")
+	assert.Equal(t, "timeout 60s sh -c "+framework.ShellQuote("while [ ! -f "+framework.ShellQuote("/tmp/a 'job'; exit 1")+" ]; do sleep 1; done"), script)
+}
+
+func TestRolloutWaitDoesNotRetrySafetyViolation(t *testing.T) {
+	runtime := &rolloutPollRuntime{}
+	steps := &WorkerRollingUpdate{runtime: runtime}
+	calls := 0
+	err := steps.waitForRollout(t.Context(), "test", time.Second, time.Millisecond, func(context.Context) (bool, error) {
+		calls++
+		if calls == 1 {
+			return false, rolloutInvariant("worker moved while job was running")
+		}
+		return true, nil
+	})
+	require.ErrorContains(t, err, "worker moved")
+	assert.Equal(t, 1, calls)
+}
+
+func TestRolloutWaitRetriesTransientObservation(t *testing.T) {
+	runtime := &rolloutPollRuntime{}
+	steps := &WorkerRollingUpdate{runtime: runtime}
+	calls := 0
+	err := steps.waitForRollout(t.Context(), "test", time.Second, time.Millisecond, func(context.Context) (bool, error) {
+		calls++
+		if calls == 1 {
+			return false, fmt.Errorf("temporary API error")
+		}
+		return true, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls)
+}
+
+type rolloutPollRuntime struct{ framework.Runtime }
+
+func (*rolloutPollRuntime) WaitFor(ctx context.Context, _ string, _, _ time.Duration, condition func(context.Context) (bool, error)) error {
+	var last error
+	for range 3 {
+		done, err := condition(ctx)
+		last = err
+		if done && err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("poll exhausted: %w", last)
 }

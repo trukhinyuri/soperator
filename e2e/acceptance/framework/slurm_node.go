@@ -15,6 +15,8 @@ var (
 	slurmNodeInstanceIDPattern = regexp.MustCompile(`\bInstanceId=([^\s]+)`)
 	slurmNodeRealMemoryPattern = regexp.MustCompile(`\bRealMemory=(\d+)`)
 	slurmNodeGPUCountPattern   = regexp.MustCompile(`\bCfgTRES=[^\s]*\bgres/gpu=(\d+)`)
+	slurmNodeCPUAllocPattern   = regexp.MustCompile(`\bCPUAlloc=(\S+)`)
+	slurmNodeAllocMemPattern   = regexp.MustCompile(`\bAllocMem=(\S+)`)
 	slurmdStartTimePattern     = regexp.MustCompile(`\bSlurmdStartTime=([^\s]+)`)
 )
 
@@ -28,6 +30,8 @@ type SlurmNodeInfo struct {
 	RealMemoryMiB   uint64
 	GPUCount        int
 	SlurmdStartTime time.Time
+	CPUAlloc        *uint64
+	AllocMemoryMiB  *uint64
 }
 
 func ParseSlurmNodeInfo(name, output string) SlurmNodeInfo {
@@ -58,7 +62,21 @@ func ParseSlurmNodeInfo(name, output string) SlurmNodeInfo {
 			info.SlurmdStartTime = value
 		}
 	}
+	info.CPUAlloc = parseSlurmAllocation(slurmNodeCPUAllocPattern, output)
+	info.AllocMemoryMiB = parseSlurmAllocation(slurmNodeAllocMemPattern, output)
 	return info
+}
+
+func parseSlurmAllocation(pattern *regexp.Regexp, output string) *uint64 {
+	match := pattern.FindStringSubmatch(output)
+	if len(match) != 2 {
+		return nil
+	}
+	value, err := strconv.ParseUint(match[1], 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &value
 }
 
 func (s *SlurmClient) NodeInfo(ctx context.Context, worker string) (SlurmNodeInfo, error) {
