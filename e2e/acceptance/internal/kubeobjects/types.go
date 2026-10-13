@@ -3,6 +3,7 @@ package kubeobjects
 import (
 	"encoding/json"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -67,7 +68,8 @@ type SlurmClusterAccounting struct {
 }
 
 type SlurmClusterLogin struct {
-	Docker SlurmClusterLoginDocker `json:"docker"`
+	CustomInitContainers []corev1.Container      `json:"customInitContainers"`
+	Docker               SlurmClusterLoginDocker `json:"docker"`
 }
 
 type SlurmClusterLoginDocker struct {

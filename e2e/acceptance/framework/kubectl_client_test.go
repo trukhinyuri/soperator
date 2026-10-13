@@ -21,7 +21,10 @@ func TestKubectlClientSlurmCluster(t *testing.T) {
 				"pamSlurmAdopt": {"enabled": true},
 				"slurmNodes": {
 					"accounting": {"enabled": true},
-					"login": {"docker": {"enabled": true}}
+					"login": {
+						"customInitContainers": [{"name": "tailscale"}],
+						"docker": {"enabled": true}
+					}
 				}
 			}
 		}`,
@@ -30,12 +33,13 @@ func TestKubectlClientSlurmCluster(t *testing.T) {
 	cluster, err := NewKubectlClient(exec).SlurmCluster(t.Context(), "soperator")
 	require.NoError(t, err)
 	assert.Equal(t, SlurmClusterInfo{
-		Name:                 "soperator",
-		Namespace:            "soperator",
-		AccountingEnabled:    true,
-		LoginDockerEnabled:   true,
-		PAMSlurmAdoptEnabled: true,
-		CustomSlurmConfig:    &customConfig,
+		Name:                  "soperator",
+		Namespace:             "soperator",
+		AccountingEnabled:     true,
+		LoginDockerEnabled:    true,
+		LoginTailscaleEnabled: true,
+		PAMSlurmAdoptEnabled:  true,
+		CustomSlurmConfig:     &customConfig,
 	}, cluster)
 }
 
